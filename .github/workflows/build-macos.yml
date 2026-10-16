@@ -1,0 +1,83 @@
+name: Build macOS DMG
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macos-14
+    env:
+      PRODUCT: "Serkan Duck Pro"
+      DMG_NAME: "SerkanDuckPro-mac"
+      # Optional signing secrets (leave unset for an ad-hoc signed build)
+      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (universal arm64 + x86_64)
+        run: cmake -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+
+      - name: Build VST3 + AU
+        run: cmake --build build --config Release --target SerkanDuckPro_VST3 SerkanDuckPro_AU -- -quiet
+
+      - name: Collect bundles
+        run: |
+          mkdir -p dmg
+          cp -R "build/SerkanDuckPro_artefacts/Release/VST3/$PRODUCT.vst3" dmg/
+          cp -R "build/SerkanDuckPro_artefacts/Release/AU/$PRODUCT.component" dmg/
+          cp packaging/Install.command dmg/
+          cp packaging/README.txt dmg/
+          chmod +x dmg/Install.command
+          lipo -info "dmg/$PRODUCT.vst3/Contents/MacOS/$PRODUCT"
+
+      - name: Import signing certificate
+        if: env.MACOS_CERT_P12 != ''
+        run: |
+          echo "$MACOS_CERT_P12" | base64 --decode > cert.p12
+          security create-keychain -p ci build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci build.keychain
+          security import cert.p12 -k build.keychain -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k ci build.keychain
+          rm cert.p12
+
+      - name: Codesign
+        run: |
+          if [ -n "$MACOS_SIGN_IDENTITY" ]; then
+            ID="$MACOS_SIGN_IDENTITY"; OPTS="--options runtime --timestamp"
+          else
+            ID="-"; OPTS=""
+          fi
+          codesign --force --deep $OPTS -s "$ID" "dmg/$PRODUCT.vst3"
+          codesign --force --deep $OPTS -s "$ID" "dmg/$PRODUCT.component"
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "$PRODUCT" -srcfolder dmg -ov -format UDZO "$DMG_NAME.dmg"
+          if [ -n "$MACOS_SIGN_IDENTITY" ]; then codesign -s "$MACOS_SIGN_IDENTITY" --timestamp "$DMG_NAME.dmg"; fi
+
+      - name: Notarize
+        if: env.MACOS_SIGN_IDENTITY != '' && env.APPLE_ID != ''
+        run: |
+          xcrun notarytool submit "$DMG_NAME.dmg" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$DMG_NAME.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SerkanDuckPro-mac
+          path: SerkanDuckPro-mac.dmg
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: SerkanDuckPro-mac.dmg
